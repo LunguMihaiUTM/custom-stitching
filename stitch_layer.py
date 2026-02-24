@@ -274,6 +274,7 @@ def stitch_layered(cap, ar_data, frame_indices, canvas_w=None, canvas_h=None,
     lat_full = (0.5 - ys / canvas_h) * np.pi        # [pi/2, -pi/2]
 
     panorama = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
+    painted = np.zeros((canvas_h, canvas_w), dtype=bool)
 
     # Compute yaw for each frame
     yaws = []
@@ -298,7 +299,7 @@ def stitch_layered(cap, ar_data, frame_indices, canvas_w=None, canvas_h=None,
     print(f"Painting {n_frames} frames sorted by yaw "
           f"(last 5 use {2*strip_half_deg:.1f}° strip)...")
 
-    def paint_frame(fi, count_label, draw_border=False, use_strip=False):
+    def paint_frame(fi, count_label, use_strip=False, gap_fill_only=False):
         idx = frame_indices[fi]
         frame = extract_frame(cap, idx)
         if frame is None:
@@ -402,30 +403,28 @@ def stitch_layered(cap, ar_data, frame_indices, canvas_w=None, canvas_h=None,
 
         pixels = np.clip(interp, 0, 255).astype(np.uint8)
 
-        panorama[canvas_row, canvas_col] = pixels
+        if gap_fill_only:
+            not_painted = ~painted[canvas_row, canvas_col]
+            if np.any(not_painted):
+                panorama[canvas_row[not_painted], canvas_col[not_painted]] = pixels[not_painted]
+                painted[canvas_row[not_painted], canvas_col[not_painted]] = True
+        else:
+            panorama[canvas_row, canvas_col] = pixels
+            painted[canvas_row, canvas_col] = True
 
-        # Red border for last 3 painted frames
-        if draw_border:
-            # Find the bounding rect of painted pixels and draw a red outline
-            r_min, r_max = canvas_row.min(), canvas_row.max()
-            c_min, c_max = canvas_col.min(), canvas_col.max()
-            thickness = 3
-            red = np.array([0, 0, 255], dtype=np.uint8)  # BGR
-            # top & bottom edges
-            for t in range(thickness):
-                panorama[np.clip(r_min + t, 0, canvas_h-1), c_min:c_max+1] = red
-                panorama[np.clip(r_max - t, 0, canvas_h-1), c_min:c_max+1] = red
-            # left & right edges
-            for t in range(thickness):
-                panorama[r_min:r_max+1, np.clip(c_min + t, 0, canvas_w-1)] = red
-                panorama[r_min:r_max+1, np.clip(c_max - t, 0, canvas_w-1)] = red
-
+    # Pass 1: all frames with full FOV (good geometry base)
     for count, fi in enumerate(order):
-        is_last_5 = count >= len(order) - 5
-        paint_frame(fi, count_label=count, draw_border=is_last_5, use_strip=is_last_5)
-        if (count + 1) % 10 == 0 or is_last_5:
-            label = " [RED BORDER, STRIP]" if is_last_5 else ""
-            print(f"  Painted {count + 1}/{n_frames} (yaw={yaws[fi]:.1f}°){label}")
+        paint_frame(fi, count_label=count, use_strip=False, gap_fill_only=False)
+        if (count + 1) % 10 == 0:
+            print(f"  Pass 1: {count + 1}/{n_frames} frames")
+    print(f"  Pass 1 done: {n_frames} frames (full FOV)")
+
+    # Pass 2: all frames again as narrow strips (overwrites with strip-aligned content)
+    for count, fi in enumerate(order):
+        paint_frame(fi, count_label=count, use_strip=True, gap_fill_only=False)
+        if (count + 1) % 10 == 0:
+            print(f"  Pass 2: {count + 1}/{n_frames} frames")
+    print(f"  Pass 2 done: {n_frames} frames (strip)")
 
     # Flip horizontally for inside-sphere view (panorama viewer convention)
     panorama = panorama[:, ::-1].copy()
