@@ -17,6 +17,9 @@ import time
 import cv2 as cv
 import numpy as np
 
+from exposure import compute_gains, apply_gain
+from blending import multiband_blend
+
 
 def fmt_time(seconds):
     m, s = divmod(int(seconds), 60)
@@ -85,6 +88,35 @@ def estimate_pivot(cam_positions):
           f"(deviation {std_dev/orbit_radius*100:.1f}%)")
 
     return pivot, orbit_radius
+
+
+def rotation_to_ypr(R):
+    """Decompose a 3x3 rotation matrix into yaw, pitch, roll (radians).
+    Convention: R = Ry(yaw) @ Rx(pitch) @ Rz(roll)
+    """
+    pitch = np.arcsin(np.clip(-R[1, 2], -1, 1))
+    cos_pitch = np.cos(pitch)
+    if abs(cos_pitch) > 1e-6:
+        yaw = np.arctan2(R[0, 2], R[2, 2])
+        roll = np.arctan2(R[1, 0], R[1, 1])
+    else:
+        yaw = np.arctan2(-R[2, 0], R[0, 0])
+        roll = 0.0
+    return yaw, pitch, roll
+
+
+def ypr_to_rotation(yaw, pitch, roll):
+    """Build rotation matrix from yaw, pitch, roll (radians).
+    R = Ry(yaw) @ Rx(pitch) @ Rz(roll)
+    """
+    cy, sy = np.cos(yaw), np.sin(yaw)
+    cp, sp = np.cos(pitch), np.sin(pitch)
+    cr, sr = np.cos(roll), np.sin(roll)
+
+    Ry = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]])
+    Rx = np.array([[1, 0, 0], [0, cp, -sp], [0, sp, cp]])
+    Rz = np.array([[cr, -sr, 0], [sr, cr, 0], [0, 0, 1]])
+    return Ry @ Rx @ Rz
 
 
 # ---------------------------------------------------------------------------
@@ -262,10 +294,22 @@ def stitch_layered(cap, ar_data, frame_indices, canvas_w=None, canvas_h=None,
           f"orbit radius: {orbit_radius:.3f}m")
     print(f"Canvas: {canvas_w}x{canvas_h}, avg focal={avg_focal:.1f}")
 
-    # Get frame dimensions
+    # Get frame dimensions and compute exposure gains
     test_frame = extract_frame(cap, frame_indices[0])
     img_h, img_w = test_frame.shape[:2]
     print(f"Frame size: {img_w}x{img_h}")
+
+    print("Computing exposure gains...")
+    all_frames = []
+    for idx in frame_indices:
+        f = extract_frame(cap, idx)
+        if f is not None:
+            all_frames.append(f)
+    exposure_gains = compute_gains(all_frames)
+    del all_frames  # free memory
+    gain_values = [sum(g)/3 for g in exposure_gains]
+    print(f"Exposure gains: min={min(gain_values):.3f}, max={max(gain_values):.3f}, "
+          f"spread={max(gain_values)-min(gain_values):.3f}")
 
     # Precompute lon/lat arrays for the full canvas
     xs = np.arange(canvas_w, dtype=np.float64)
@@ -274,7 +318,6 @@ def stitch_layered(cap, ar_data, frame_indices, canvas_w=None, canvas_h=None,
     lat_full = (0.5 - ys / canvas_h) * np.pi        # [pi/2, -pi/2]
 
     panorama = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
-    painted = np.zeros((canvas_h, canvas_w), dtype=bool)
 
     # Compute yaw for each frame
     yaws = []
@@ -401,16 +444,11 @@ def stitch_layered(cap, ar_data, frame_indices, canvas_w=None, canvas_h=None,
         canvas_row = rows[sub_row]
         canvas_col = cols[sub_col]
 
+        # Apply exposure correction
+        interp = apply_gain(interp, exposure_gains[fi])
         pixels = np.clip(interp, 0, 255).astype(np.uint8)
 
-        if gap_fill_only:
-            not_painted = ~painted[canvas_row, canvas_col]
-            if np.any(not_painted):
-                panorama[canvas_row[not_painted], canvas_col[not_painted]] = pixels[not_painted]
-                painted[canvas_row[not_painted], canvas_col[not_painted]] = True
-        else:
-            panorama[canvas_row, canvas_col] = pixels
-            painted[canvas_row, canvas_col] = True
+        panorama[canvas_row, canvas_col] = pixels
 
     # Pass 1: all frames with full FOV (good geometry base)
     for count, fi in enumerate(order):
@@ -419,12 +457,205 @@ def stitch_layered(cap, ar_data, frame_indices, canvas_w=None, canvas_h=None,
             print(f"  Pass 1: {count + 1}/{n_frames} frames")
     print(f"  Pass 1 done: {n_frames} frames (full FOV)")
 
-    # Pass 2: all frames again as narrow strips (overwrites with strip-aligned content)
+    # Pass 2: blend narrow strips onto panorama using multi-band blending.
+    # For each frame, render its strip into a patch, then blend it with
+    # the existing panorama content using Laplacian pyramid blending.
+    # This smooths brightness transitions while keeping details sharp.
+    print(f"  Pass 2: blending {n_frames} strips (multi-band)...")
     for count, fi in enumerate(order):
-        paint_frame(fi, count_label=count, use_strip=True, gap_fill_only=False)
+        idx = frame_indices[fi]
+        frame = extract_frame(cap, idx)
+        if frame is None:
+            continue
+
+        # Compute strip column range
+        yaw_rad = np.radians(yaws[fi])
+        strip_half_rad = np.radians(strip_half_deg)
+        lon_lo = yaw_rad - strip_half_rad
+        lon_hi = yaw_rad + strip_half_rad
+        col_lo = int(np.clip((lon_lo / (2 * np.pi) + 0.5) * canvas_w, 0, canvas_w - 1))
+        col_hi = int(np.clip((lon_hi / (2 * np.pi) + 0.5) * canvas_w, 0, canvas_w - 1))
+
+        # Also need row range from FOV bounds
+        bounds = frame_canvas_bounds(R_c2ws[fi], Ks[fi], img_w, img_h,
+                                     canvas_w, canvas_h)
+        if bounds is None:
+            continue
+        _, _, row_start, row_end, _ = bounds
+
+        # Build column indices for strip
+        if col_lo <= col_hi:
+            cols = np.arange(col_lo, col_hi + 1)
+        else:
+            cols = np.concatenate([np.arange(col_lo, canvas_w),
+                                   np.arange(0, col_hi + 1)])
+        rows = np.arange(row_start, row_end + 1)
+
+        if len(cols) == 0 or len(rows) == 0:
+            continue
+
+        # Render this frame's strip into a small patch
+        sub_lon = lon_full[cols]
+        sub_lat = lat_full[rows]
+        sub_lon_grid, sub_lat_grid = np.meshgrid(sub_lon, sub_lat)
+        sub_rays = equirect_to_ray(sub_lon_grid, sub_lat_grid)
+        sub_h, sub_w = sub_rays.shape[:2]
+        rays_flat = sub_rays.reshape(-1, 3).astype(np.float32)
+
+        offset = cam_offsets[fi]
+        scene_pts = scene_distance * rays_flat.T - offset[:, np.newaxis]
+        cam_coords = R_w2cs[fi] @ scene_pts
+        z = cam_coords[2, :]
+        valid = z > 0
+
+        u = np.full(len(rays_flat), -1.0, dtype=np.float32)
+        v = np.full(len(rays_flat), -1.0, dtype=np.float32)
+        u[valid] = cam_coords[0, valid] / z[valid] * Ks[fi][0, 0] + Ks[fi][0, 2]
+        v[valid] = cam_coords[1, valid] / z[valid] * Ks[fi][1, 1] + Ks[fi][1, 2]
+        in_bounds = valid & (u >= 0) & (u < img_w - 1) & (v >= 0) & (v < img_h - 1)
+
+        if not np.any(in_bounds):
+            continue
+
+        # Bilinear sample
+        u_valid = u[in_bounds]
+        v_valid = v[in_bounds]
+        u0 = np.floor(u_valid).astype(np.int32)
+        v0 = np.floor(v_valid).astype(np.int32)
+        u1 = np.clip(u0 + 1, 0, img_w - 1)
+        v1 = np.clip(v0 + 1, 0, img_h - 1)
+        u0 = np.clip(u0, 0, img_w - 1)
+        v0 = np.clip(v0, 0, img_h - 1)
+        du = (u_valid - u0).astype(np.float32)[:, np.newaxis]
+        dv = (v_valid - v0).astype(np.float32)[:, np.newaxis]
+        p00 = frame[v0, u0].astype(np.float32)
+        p01 = frame[v0, u1].astype(np.float32)
+        p10 = frame[v1, u0].astype(np.float32)
+        p11 = frame[v1, u1].astype(np.float32)
+        interp = (p00 * (1 - du) * (1 - dv) +
+                  p01 * du * (1 - dv) +
+                  p10 * (1 - du) * dv +
+                  p11 * du * dv)
+
+        # Apply exposure correction
+        interp = apply_gain(interp, exposure_gains[fi])
+
+        # Build the strip patch (new frame content) and mask
+        strip_patch = np.zeros((sub_h, sub_w, 3), dtype=np.uint8)
+        strip_mask = np.zeros((sub_h, sub_w), dtype=np.float32)
+
+        flat_idx = np.where(in_bounds)[0]
+        sr = flat_idx // sub_w
+        sc = flat_idx % sub_w
+        pixels = np.clip(interp, 0, 255).astype(np.uint8)
+        strip_patch[sr, sc] = pixels
+        strip_mask[sr, sc] = 1.0
+
+        # Extract the corresponding panorama region
+        row_ix = rows[:, np.newaxis]   # (sub_h, 1)
+        col_ix = cols[np.newaxis, :]   # (1, sub_w)
+        pano_patch = panorama[row_ix, col_ix]  # (sub_h, sub_w, 3)
+
+        # Create a feathered blend mask: full blend in center, fade at edges
+        # Horizontal feather based on distance from strip center
+        n_cols = len(cols)
+        feather_width = max(n_cols // 6, 4)
+        feather = np.ones(n_cols, dtype=np.float32)
+        ramp = np.linspace(0.0, 1.0, feather_width)
+        feather[:feather_width] = ramp
+        feather[-feather_width:] = ramp[::-1]
+        blend_mask = strip_mask * feather[np.newaxis, :]
+
+        # Only blend where both panorama and strip have content
+        pano_has_content = np.any(pano_patch > 0, axis=2).astype(np.float32)
+        # Where pano is empty, just paste the strip directly
+        direct_paste = (blend_mask > 0) & (pano_has_content < 0.5)
+
+        # Multi-band blend where both have content
+        if np.any(blend_mask * pano_has_content > 0):
+            # Ensure patch dimensions are at least 8x8 for pyramid blending
+            if sub_h >= 8 and sub_w >= 8:
+                blended = multiband_blend(pano_patch, strip_patch,
+                                          blend_mask, levels=4)
+            else:
+                # Too small for pyramid, do simple alpha blend
+                m3 = blend_mask[:, :, np.newaxis]
+                blended = (pano_patch.astype(np.float32) * (1 - m3) +
+                           strip_patch.astype(np.float32) * m3)
+                blended = np.clip(blended, 0, 255).astype(np.uint8)
+
+            # Write blended result back where mask > 0
+            update = blend_mask > 0
+            for c in range(3):
+                ch = panorama[row_ix, col_ix, c]
+                ch[update] = blended[:, :, c][update]
+                panorama[row_ix, col_ix, c] = ch
+
+        # Direct paste where panorama was empty
+        if np.any(direct_paste):
+            for c in range(3):
+                ch = panorama[row_ix, col_ix, c]
+                ch[direct_paste] = strip_patch[:, :, c][direct_paste]
+                panorama[row_ix, col_ix, c] = ch
+
         if (count + 1) % 10 == 0:
-            print(f"  Pass 2: {count + 1}/{n_frames} frames")
-    print(f"  Pass 2 done: {n_frames} frames (strip)")
+            print(f"    {count + 1}/{n_frames} strips blended")
+    print(f"  Pass 2 done: {n_frames} strips (multi-band blended)")
+
+    # Post-process: equalize brightness across vertical strips.
+    # Divide panorama into narrow columns, measure each column's average
+    # brightness, smooth it, and apply correction so all columns match
+    # the global median brightness.
+    print("Equalizing brightness across panorama...")
+    painted = np.any(panorama > 0, axis=2)
+    lab = cv.cvtColor(panorama, cv.COLOR_BGR2LAB).astype(np.float32)
+    L = lab[:, :, 0]
+
+    # Measure average brightness per column (only painted pixels)
+    n_strips = canvas_w
+    col_brightness = np.zeros(n_strips, dtype=np.float32)
+    for c in range(n_strips):
+        col_mask = painted[:, c]
+        if np.any(col_mask):
+            col_brightness[c] = L[col_mask, c].mean()
+        else:
+            col_brightness[c] = 0
+
+    # Fill gaps (unpainted columns) with nearest valid value
+    valid_cols = col_brightness > 0
+    if np.any(valid_cols):
+        # Interpolate over gaps
+        valid_idx = np.where(valid_cols)[0]
+        col_brightness_filled = np.interp(
+            np.arange(n_strips), valid_idx, col_brightness[valid_idx])
+
+        # Target: median brightness across all painted columns
+        target_L = float(np.median(col_brightness_filled[valid_cols]))
+
+        # Smooth the brightness profile heavily to avoid artifacts
+        smooth_size = max(canvas_w // 8, 31)
+        if smooth_size % 2 == 0:
+            smooth_size += 1
+        col_smooth = cv.GaussianBlur(
+            col_brightness_filled.reshape(1, -1),
+            (smooth_size, 1), 0).flatten()
+
+        # Gain per column: target / local_smooth_brightness
+        col_gain = np.ones(n_strips, dtype=np.float32)
+        valid_smooth = col_smooth > 1.0
+        col_gain[valid_smooth] = target_L / col_smooth[valid_smooth]
+        col_gain = np.clip(col_gain, 0.6, 1.6)
+
+        # Apply gain to L channel
+        gain_2d = col_gain[np.newaxis, :]  # (1, W) broadcast over rows
+        L_corrected = L * gain_2d
+        lab[:, :, 0] = np.clip(L_corrected, 0, 255)
+        panorama = cv.cvtColor(lab.astype(np.uint8), cv.COLOR_LAB2BGR)
+        panorama[~painted] = 0
+
+        gain_range = col_gain[valid_cols]
+        print(f"  Brightness equalization: target L={target_L:.1f}, "
+              f"gain range [{gain_range.min():.3f}, {gain_range.max():.3f}]")
 
     # Flip horizontally for inside-sphere view (panorama viewer convention)
     panorama = panorama[:, ::-1].copy()
